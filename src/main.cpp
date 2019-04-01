@@ -15,11 +15,14 @@
 using nlohmann::json;
 using std::string;
 using std::vector;
+using Eigen::VectorXd;
 
 // For converting back and forth between radians and degrees.
 constexpr double pi() { return M_PI; }
 double deg2rad(double x) { return x * pi() / 180; }
 double rad2deg(double x) { return x * 180 / pi(); }
+
+const double Lf = 2.67;
 
 int main() {
   uWS::Hub h;
@@ -47,22 +50,69 @@ int main() {
           double py = j[1]["y"];
           double psi = j[1]["psi"];
           double v = j[1]["speed"];
-
+		  double delta= j[1]["steering_angle"];
+        
           /**
            * TODO: Calculate steering angle and throttle using MPC.
            * Both are in between [-1, 1].
            */
-          double steer_value;
-          double throttle_value;
+		  // Transform the waypoint from global coordinates to car coordinate system
+		  
+		  VectorXd ptsx_trans(ptsx.size());
+		  VectorXd ptsy_trans(ptsy.size());
+		  for(unsigned int i = 0; i<ptsx.size(); i++){ 
+			// Move the coordinate system 
+			double dx = ptsx[i] - px;
+            double dy = ptsy[i] - py;
+			// Rotate new coordinate system
+            ptsx_trans[i] = ( dx * cos(psi) + dy * sin(psi) );
+            ptsy_trans[i] = ( -dx * sin(psi) + dy * cos(psi) );
+		  }
+		  
+		   //fit a 3rd orden polynomial to the x and y coordinates
+          auto coeffs = polyfit(ptsx_trans, ptsy_trans, 3);
+		  
+		  /**
+		   * Try to compensate the effect of the latency. We are going to calculate 
+		   * the status of the car in the future
+		   */
+		  // Actuator latency in seconds
+		  double latency = 0.1;
+		  
+		  // Initial state
+          double x0 = 0;
+          double y0 = 0;
+          double psi0 = 0;
+		  double v0 = v;
+          double cte0 = polyeval(coeffs, 0); // cte[t] = f(x[t-1]) - 0 + 0
+          double epsi0 = -atan(coeffs[1]);  // epsi[t] = 0 - psides[t-1] + 0 
+		  
+		  
+		  // Initial state modified due latency
+          double x_d = x0 + ( v * cos(psi0) * latency );  // x_[t] = x[t-1] + v[t-1] * cos(psi[t-1]) * dt
+          double y_d = y0 + ( v * sin(psi0) * latency ); // y_[t] = y[t-1] + v[t-1] * sin(psi[t-1]) * dt
+          double psi_d = psi0 - ( v * delta * latency / Lf ); // psi_[t] = psi[t-1] - v[t-1] / Lf * delta[t-1] * dt
+          double v_d = v0;  // same speed because i can't  tranform acceleration from [-1,1] to m/s^2
+          double cte_d = cte0 + ( v * sin(epsi0) * latency ); 
+          double epsi_d = epsi0 - ( v * atan(coeffs[1]) * latency / Lf ); // epsi[t] = psi[t] - psides[t-1] + v[t-1] * delta[t-1] / Lf * dt
+                   
+
+          // Run MPC 
+		  Eigen::VectorXd state(6);
+          state << x_d, y_d, psi_d, v_d, cte_d, epsi_d;
+          auto vars = mpc.Solve(state, coeffs);
+		          		  
+		  double steer_value = vars[0];
+          double throttle_value = vars[1];
 
           json msgJson;
           // NOTE: Remember to divide by deg2rad(25) before you send the 
           //   steering value back. Otherwise the values will be in between 
           //   [-deg2rad(25), deg2rad(25] instead of [-1, 1].
-          msgJson["steering_angle"] = steer_value;
+          msgJson["steering_angle"] = steer_value/deg2rad(25);
           msgJson["throttle"] = throttle_value;
 
-          // Display the MPC predicted trajectory 
+          // Display the MPC predicted trajectory  in green
           vector<double> mpc_x_vals;
           vector<double> mpc_y_vals;
 
@@ -71,13 +121,22 @@ int main() {
            *   the vehicle's coordinate system the points in the simulator are 
            *   connected by a Green line
            */
-
+		  for (unsigned int i = 2 ; i < vars.size(); i += 2){
+            mpc_x_vals.push_back(vars[i]);
+            mpc_y_vals.push_back(vars[i + 1]);
+          }
+		 
           msgJson["mpc_x"] = mpc_x_vals;
           msgJson["mpc_y"] = mpc_y_vals;
 
-          // Display the waypoints/reference line
+          // Display the waypoints/reference line in yellow
+		  // I use the same ptsx values but fitted the third order polynomial
           vector<double> next_x_vals;
           vector<double> next_y_vals;
+		  for (unsigned int i = 0 ; i < ptsx_trans.size(); i++){
+            next_x_vals.push_back(ptsx_trans[i]);
+		    next_y_vals.push_back(polyeval(coeffs, ptsx_trans[i]));
+          }
 
           /**
            * TODO: add (x,y) points to list here, points are in reference to 
